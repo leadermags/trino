@@ -111,8 +111,6 @@ import static io.trino.plugin.hive.HiveTableProperties.STORAGE_FORMAT_PROPERTY;
 import static io.trino.plugin.hive.HiveTestUtils.TYPE_MANAGER;
 import static io.trino.plugin.hive.HiveType.toHiveType;
 import static io.trino.plugin.hive.util.HiveUtil.columnExtraInfo;
-import static io.trino.spi.predicate.Marker.Bound.ABOVE;
-import static io.trino.spi.predicate.Marker.Bound.EXACTLY;
 import static io.trino.spi.security.Identity.ofUser;
 import static io.trino.spi.security.SelectedRole.Type.ROLE;
 import static io.trino.spi.type.BigintType.BIGINT;
@@ -128,6 +126,8 @@ import static io.trino.spi.type.VarcharType.createUnboundedVarcharType;
 import static io.trino.spi.type.VarcharType.createVarcharType;
 import static io.trino.sql.analyzer.FeaturesConfig.JoinDistributionType.BROADCAST;
 import static io.trino.sql.planner.optimizations.PlanNodeSearcher.searchFrom;
+import static io.trino.sql.planner.planprinter.IoPlanPrinter.FormattedMarker.Bound.ABOVE;
+import static io.trino.sql.planner.planprinter.IoPlanPrinter.FormattedMarker.Bound.EXACTLY;
 import static io.trino.sql.planner.planprinter.PlanPrinter.textLogicalPlan;
 import static io.trino.testing.MaterializedResult.resultBuilder;
 import static io.trino.testing.QueryAssertions.assertEqualsIgnoreOrder;
@@ -163,6 +163,7 @@ import static org.testng.Assert.fail;
 import static org.testng.FileAssert.assertFile;
 
 public class TestHiveIntegrationSmokeTest
+        // TODO extend BaseConnectorTest
         extends AbstractTestIntegrationSmokeTest
 {
     private static final DateTimeFormatter TIMESTAMP_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSSSSS");
@@ -2011,7 +2012,12 @@ public class TestHiveIntegrationSmokeTest
 
         assertQuery("SELECT * from " + tableName, "VALUES ('a', 'b', 'c'), ('aa', 'bb', 'cc'), ('aaa', 'bbb', 'ccc')");
 
-        assertUpdate(parallelWriter, "INSERT INTO " + tableName + " VALUES ('a0', 'b0', 'c0')", 1);
+        assertUpdate(
+                parallelWriter,
+                "INSERT INTO " + tableName + " VALUES ('a0', 'b0', 'c0')",
+                1,
+                // buckets should be repartitioned locally hence local repartitioned exchange should exist in plan
+                assertLocalRepartitionedExchangesCount(1));
         assertUpdate(parallelWriter, "INSERT INTO " + tableName + " VALUES ('a1', 'b1', 'c1')", 1);
 
         assertQuery("SELECT * from " + tableName, "VALUES ('a', 'b', 'c'), ('aa', 'bb', 'cc'), ('aaa', 'bbb', 'ccc'), ('a0', 'b0', 'c0'), ('a1', 'b1', 'c1')");
@@ -2182,6 +2188,59 @@ public class TestHiveIntegrationSmokeTest
 
         assertUpdate("DROP TABLE " + tableName);
         assertFalse(getQueryRunner().tableExists(getSession(), tableName));
+    }
+
+    @Test
+    public void testInsertIntoPartitionedBucketedTableFromBucketedTable()
+    {
+        testInsertIntoPartitionedBucketedTableFromBucketedTable(HiveStorageFormat.RCBINARY);
+    }
+
+    private void testInsertIntoPartitionedBucketedTableFromBucketedTable(HiveStorageFormat storageFormat)
+    {
+        String sourceTable = "test_insert_partitioned_bucketed_table_source";
+        String targetTable = "test_insert_partitioned_bucketed_table_target";
+        try {
+            @Language("SQL") String createSourceTable = "" +
+                    "CREATE TABLE " + sourceTable + " " +
+                    "WITH (" +
+                    "format = '" + storageFormat + "', " +
+                    "bucketed_by = ARRAY[ 'custkey' ], " +
+                    "bucket_count = 10 " +
+                    ") " +
+                    "AS " +
+                    "SELECT custkey, comment, orderstatus " +
+                    "FROM tpch.tiny.orders";
+            @Language("SQL") String createTargetTable = "" +
+                    "CREATE TABLE " + targetTable + " " +
+                    "WITH (" +
+                    "format = '" + storageFormat + "', " +
+                    "partitioned_by = ARRAY[ 'orderstatus' ], " +
+                    "bucketed_by = ARRAY[ 'custkey' ], " +
+                    "bucket_count = 10 " +
+                    ") " +
+                    "AS " +
+                    "SELECT custkey, comment, orderstatus " +
+                    "FROM tpch.tiny.orders";
+
+            assertUpdate(getParallelWriteSession(), createSourceTable, "SELECT count(*) FROM orders");
+            assertUpdate(getParallelWriteSession(), createTargetTable, "SELECT count(*) FROM orders");
+
+            transaction(getQueryRunner().getTransactionManager(), getQueryRunner().getAccessControl()).execute(
+                    getParallelWriteSession(),
+                    transactionalSession -> {
+                        assertUpdate(
+                                transactionalSession,
+                                "INSERT INTO " + targetTable + " SELECT * FROM " + sourceTable,
+                                15000,
+                                // there should be two remove exchanges, one below TableWriter and one below TableCommit
+                                assertRemoteExchangesCount(transactionalSession, 2));
+                    });
+        }
+        finally {
+            assertUpdate("DROP TABLE IF EXISTS " + sourceTable);
+            assertUpdate("DROP TABLE IF EXISTS " + targetTable);
+        }
     }
 
     @Test
@@ -5636,19 +5695,50 @@ public class TestHiveIntegrationSmokeTest
 
     private Consumer<Plan> assertRemoteExchangesCount(int expectedRemoteExchangesCount)
     {
+        return assertRemoteExchangesCount(getSession(), expectedRemoteExchangesCount);
+    }
+
+    private Consumer<Plan> assertRemoteExchangesCount(Session session, int expectedRemoteExchangesCount)
+    {
         return plan -> {
             int actualRemoteExchangesCount = searchFrom(plan.getRoot())
                     .where(node -> node instanceof ExchangeNode && ((ExchangeNode) node).getScope() == ExchangeNode.Scope.REMOTE)
                     .findAll()
                     .size();
             if (actualRemoteExchangesCount != expectedRemoteExchangesCount) {
-                Session session = getSession();
                 Metadata metadata = getDistributedQueryRunner().getCoordinator().getMetadata();
                 String formattedPlan = textLogicalPlan(plan.getRoot(), plan.getTypes(), metadata, StatsAndCosts.empty(), session, 0, false);
                 throw new AssertionError(format(
                         "Expected [\n%s\n] remote exchanges but found [\n%s\n] remote exchanges. Actual plan is [\n\n%s\n]",
                         expectedRemoteExchangesCount,
                         actualRemoteExchangesCount,
+                        formattedPlan));
+            }
+        };
+    }
+
+    private Consumer<Plan> assertLocalRepartitionedExchangesCount(int expectedLocalExchangesCount)
+    {
+        return plan -> {
+            int actualLocalExchangesCount = searchFrom(plan.getRoot())
+                    .where(node -> {
+                        if (!(node instanceof ExchangeNode)) {
+                            return false;
+                        }
+
+                        ExchangeNode exchangeNode = (ExchangeNode) node;
+                        return exchangeNode.getScope() == ExchangeNode.Scope.LOCAL && exchangeNode.getType() == ExchangeNode.Type.REPARTITION;
+                    })
+                    .findAll()
+                    .size();
+            if (actualLocalExchangesCount != expectedLocalExchangesCount) {
+                Session session = getSession();
+                Metadata metadata = getDistributedQueryRunner().getCoordinator().getMetadata();
+                String formattedPlan = textLogicalPlan(plan.getRoot(), plan.getTypes(), metadata, StatsAndCosts.empty(), session, 0, false);
+                throw new AssertionError(format(
+                        "Expected [\n%s\n] local repartitioned exchanges but found [\n%s\n] local repartitioned exchanges. Actual plan is [\n\n%s\n]",
+                        expectedLocalExchangesCount,
+                        actualLocalExchangesCount,
                         formattedPlan));
             }
         };

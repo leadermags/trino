@@ -79,7 +79,8 @@ public class FeaturesConfig
     private JoinReorderingStrategy joinReorderingStrategy = JoinReorderingStrategy.AUTOMATIC;
     private int maxReorderedJoins = 9;
     private boolean redistributeWrites = true;
-    private boolean usePreferredWritePartitioning;
+    private boolean usePreferredWritePartitioning = true;
+    private int preferredWritePartitioningMinNumberOfPartitions = 50;
     private boolean scaleWriters;
     private DataSize writerMinSize = DataSize.of(32, DataSize.Unit.MEGABYTE);
     private boolean optimizeMetadataQueries;
@@ -135,7 +136,6 @@ public class FeaturesConfig
     private DataSize filterAndProjectMinOutputPageSize = DataSize.of(500, KILOBYTE);
     private int filterAndProjectMinOutputPageRowCount = 256;
     private int maxGroupingSets = 2048;
-    private JoinPushdownMode joinPushdownMode = JoinPushdownMode.DISABLED;
 
     public enum JoinReorderingStrategy
     {
@@ -166,21 +166,6 @@ public class FeaturesConfig
         NONE,
         ABORT,
         RETRY,
-        /**/;
-    }
-
-    public enum JoinPushdownMode
-    {
-        /**
-         * Do not try to push joins to connector.
-         */
-        DISABLED,
-        /**
-         * Try to push all joins except cross-joins to connector.
-         */
-        EAGER,
-        // TODO Add cost based logic to join pushdown
-        // AUTOMATIC,
         /**/;
     }
 
@@ -386,6 +371,20 @@ public class FeaturesConfig
     public FeaturesConfig setUsePreferredWritePartitioning(boolean usePreferredWritePartitioning)
     {
         this.usePreferredWritePartitioning = usePreferredWritePartitioning;
+        return this;
+    }
+
+    @Min(0)
+    public int getPreferredWritePartitioningMinNumberOfPartitions()
+    {
+        return preferredWritePartitioningMinNumberOfPartitions;
+    }
+
+    @Config("preferred-write-partitioning-min-number-of-partitions")
+    @ConfigDescription("Use preferred write partitioning when the number of written partitions exceeds the configured threshold")
+    public FeaturesConfig setPreferredWritePartitioningMinNumberOfPartitions(int preferredWritePartitioningMinNumberOfPartitions)
+    {
+        this.preferredWritePartitioningMinNumberOfPartitions = preferredWritePartitioningMinNumberOfPartitions;
         return this;
     }
 
@@ -1031,18 +1030,6 @@ public class FeaturesConfig
     public FeaturesConfig setPlanWithTableNodePartitioning(boolean planWithTableNodePartitioning)
     {
         this.planWithTableNodePartitioning = planWithTableNodePartitioning;
-        return this;
-    }
-
-    public JoinPushdownMode getJoinPushdownMode()
-    {
-        return joinPushdownMode;
-    }
-
-    @Config("optimizer.join-pushdown")
-    public FeaturesConfig setJoinPushdownMode(JoinPushdownMode joinPushdownMode)
-    {
-        this.joinPushdownMode = joinPushdownMode;
         return this;
     }
 }

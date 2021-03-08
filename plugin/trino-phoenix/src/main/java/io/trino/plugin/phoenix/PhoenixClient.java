@@ -252,9 +252,9 @@ public class PhoenixClient
                 Optional.empty(),
                 columnHandles,
                 ImmutableMap.of(),
-                phoenixSplit.getConstraint(),
+                table.getConstraint(),
                 split.getAdditionalPredicate());
-        preparedQuery = preparedQuery.transformQuery(tryApplyLimit(table.getLimit()));
+        preparedQuery = applyQueryTransformations(table, preparedQuery);
         PreparedStatement query = queryBuilder.prepareStatement(session, connection, preparedQuery);
         QueryPlan queryPlan = getQueryPlan((PhoenixPreparedStatement) query);
         ResultSet resultSet = getResultSet(phoenixSplit.getPhoenixInputSplit(), queryPlan);
@@ -271,7 +271,19 @@ public class PhoenixClient
     @Override
     protected Optional<BiFunction<String, Long, String>> limitFunction()
     {
-        return Optional.of((sql, limit) -> sql + " LIMIT " + limit);
+        return Optional.of((sql, limit) -> {
+            if (limit > Integer.MAX_VALUE) {
+                return sql;
+            }
+            return sql + " LIMIT " + limit;
+        });
+    }
+
+    @Override
+    public boolean isLimitGuaranteed(ConnectorSession session)
+    {
+        // Note that limit exceeding Integer.MAX_VALUE gets completely ignored.
+        return false;
     }
 
     @Override
@@ -348,16 +360,16 @@ public class PhoenixClient
                 return Optional.of(decimalColumnMapping(createDecimalType(precision, max(decimalDigits, 0)), UNNECESSARY));
 
             case Types.CHAR:
-                return Optional.of(defaultCharColumnMapping(typeHandle.getRequiredColumnSize()));
+                return Optional.of(defaultCharColumnMapping(typeHandle.getRequiredColumnSize(), true));
 
             case VARCHAR:
             case NVARCHAR:
             case LONGVARCHAR:
             case LONGNVARCHAR:
                 if (typeHandle.getColumnSize().isEmpty()) {
-                    return Optional.of(varcharColumnMapping(createUnboundedVarcharType()));
+                    return Optional.of(varcharColumnMapping(createUnboundedVarcharType(), true));
                 }
-                return Optional.of(defaultVarcharColumnMapping(typeHandle.getRequiredColumnSize()));
+                return Optional.of(defaultVarcharColumnMapping(typeHandle.getRequiredColumnSize(), true));
 
             case Types.VARBINARY:
                 return Optional.of(varbinaryColumnMapping());
@@ -462,12 +474,6 @@ public class PhoenixClient
             return WriteMapping.objectMapping(elementDataType + " ARRAY", arrayWriteFunction(session, elementType, elementWriteName));
         }
         return legacyToWriteMapping(session, type);
-    }
-
-    @Override
-    public boolean isLimitGuaranteed(ConnectorSession session)
-    {
-        return false;
     }
 
     @Override
